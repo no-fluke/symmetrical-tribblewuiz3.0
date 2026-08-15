@@ -11,6 +11,7 @@ from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -53,21 +54,20 @@ if not all([BOT_TOKEN, API_ID, API_HASH]):
 API_ID = int(API_ID)
 
 # ======================== PATHS ==========================
-IMAGE_DIR = "quiz_images"
+IMAGE_DIR   = "quiz_images"
+OUTPUT_JSON = "quiz_output.json"
+OUTPUT_TXT  = "quiz_output.txt"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 # ===================== RATE LIMITS =======================
-SEND_DELAY_MIN  = 4.0
-SEND_DELAY_MAX  = 7.0
-BURST_EVERY     = 10
-BURST_PAUSE_MIN = 25.0
-BURST_PAUSE_MAX = 35.0
+SEND_DELAY_MIN  = 4.0    # min gap between sends (seconds)
+SEND_DELAY_MAX  = 7.0    # max gap (randomised)
+BURST_EVERY     = 10     # take a longer break after every N sends
+BURST_PAUSE_MIN = 25.0   # min burst pause (seconds)
+BURST_PAUSE_MAX = 35.0   # max burst pause (seconds)
 
-VOTE_DELAY  = 2.5
-AUTO_VOTE   = True
-
-OUTPUT_JSON = "quiz_output.json"
-OUTPUT_TXT  = "quiz_output.txt"
+VOTE_DELAY = 2.5
+AUTO_VOTE  = True
 
 RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "")
 PING_INTERVAL = 20
@@ -93,12 +93,13 @@ async def smart_delay():
 
 
 async def safe_send(coro, retries: int = 6):
+    """Retry any bot.send_* call on RetryAfter / network errors."""
     for attempt in range(retries):
         try:
             return await coro
         except RetryAfter as e:
             wait = e.retry_after + random.uniform(5, 15)
-            print(f"  ⚠️  Rate-limit: retry_after={e.retry_after}s → sleeping {wait:.1f}s")
+            print(f"  ⚠️  Rate-limit: sleeping {wait:.1f}s")
             await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
             wait = (2 ** attempt) + random.uniform(1, 5)
@@ -109,12 +110,44 @@ async def safe_send(coro, retries: int = 6):
     raise RuntimeError(f"safe_send failed after {retries} attempts")
 
 
+async def safe_send_photo(bot, dest_chat_id, img_path,
+                          caption=None, reply_to_id=None, retries=6):
+    """
+    Send a photo with retry logic.
+    Keeps the file handle open only during the actual attempt so
+    retries always send from the start of the file.
+    60s read/write timeouts on the bot mean this almost never
+    triggers a retry in the first place.
+    """
+    for attempt in range(retries):
+        try:
+            with open(img_path, "rb") as f:
+                return await bot.send_photo(
+                    chat_id             = dest_chat_id,
+                    photo               = f,
+                    caption             = caption[:1024] if caption else None,
+                    reply_to_message_id = reply_to_id,
+                )
+        except RetryAfter as e:
+            wait = e.retry_after + random.uniform(5, 15)
+            print(f"  ⚠️  Rate-limit on photo: sleeping {wait:.1f}s")
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            wait = (2 ** attempt) + random.uniform(1, 5)
+            print(f"  ⚠️  Photo network error ({e}), "
+                  f"retry {attempt+1}/{retries} in {wait:.1f}s")
+            await asyncio.sleep(wait)
+        except Exception:
+            raise
+    raise RuntimeError(f"safe_send_photo failed after {retries} attempts")
+
+
 # ================== TELETHON SESSION HELPER ==============
 
 async def get_client(user_id: str) -> Optional[TelegramClient]:
-    user_doc = await get_user(user_id)
+    user_doc    = await get_user(user_id)
     session_str = user_doc.get("session_string", "")
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    client      = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
     return client
 
@@ -170,7 +203,9 @@ def build_bot_caption(quiz: dict, number: int) -> str:
     lines.append("")
     correct = quiz["correct_answer_index"]
     for ans in quiz["answers"]:
-        letter = OPTION_LETTERS[ans["index"]] if ans["index"] < len(OPTION_LETTERS) else str(ans["index"] + 1)
+        letter = (OPTION_LETTERS[ans["index"]]
+                  if ans["index"] < len(OPTION_LETTERS)
+                  else str(ans["index"] + 1))
         text = escape_md(ans["text"])
         if correct is not None and ans["index"] == correct:
             lines.append(f"✅ *{letter}\\. {text}*")
@@ -185,17 +220,18 @@ def build_bot_caption(quiz: dict, number: int) -> str:
 
 def format_quiz_text(quiz: dict, number: int) -> str:
     lines = [
-        "="*60,
+        "=" * 60,
         f"Quiz #{number}  |  ID: {quiz['message_id']}  |  {quiz['date']}"
         + ("  [auto-voted]" if quiz.get("auto_voted") else ""),
-        "="*60,
+        "=" * 60,
         f"Q: {quiz['question']}\n",
     ]
     for ans in quiz["answers"]:
         marker = ""
         if quiz["correct_answer_index"] is not None:
             marker = " ✅" if ans["index"] == quiz["correct_answer_index"] else " ❌"
-        voters = f"  [{ans.get('voters','?')} votes]" if ans.get("voters") is not None else ""
+        voters = (f"  [{ans.get('voters','?')} votes]"
+                  if ans.get("voters") is not None else "")
         lines.append(f"  {ans['index']+1}. {ans['text']}{marker}{voters}")
     if quiz.get("explanation"):
         lines.append(f"\n💡 {quiz['explanation']}")
@@ -218,24 +254,10 @@ def _poll_has_no_question(poll_data: dict) -> bool:
     return q == "" or q == "."
 
 
-def _image_is_paired_with_poll(prev_msg, poll_msg, poll_data: dict) -> bool:
-    """
-    Paired when:
-      1. IDs are consecutive (gap == 1) — image posted immediately before poll
-      2. Poll has no real question text — image IS the question
-    Not paired when gap > 1 AND poll has a real question.
-    """
-    if prev_msg is None:
-        return False
-    id_gap      = poll_msg.id - prev_msg.id
-    no_question = _poll_has_no_question(poll_data)
-    return id_gap == 1 or no_question
-
-
 # =================== BOT COMMANDS ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    user       = update.effective_user
     first_name = user.first_name if user and user.first_name else "there"
     await update.message.reply_text(
         f"👋 *Welcome, {first_name}!*\n\n"
@@ -276,7 +298,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    user_id  = str(update.effective_user.id)
     user_doc = await get_user(user_id)
     if not user_doc.get("session_string"):
         await update.message.reply_text("❌ You are not logged in.")
@@ -299,7 +321,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    user_id  = str(update.effective_user.id)
     user_doc = await get_user(user_id)
     if user_doc.get("session_string"):
         try:
@@ -317,6 +339,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Not logged in. Use /login to authenticate.")
 
 
+# ---------------- LOGIN STATE ----------------------------
 LOGIN_STATE = {}
 
 
@@ -509,8 +532,10 @@ async def _remove_destination(user_id: str, chat_id) -> list[dict]:
 def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
     for d in dests:
-        buttons.append([InlineKeyboardButton(f"📢 {d['label']}",
-                        callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}")])
+        buttons.append([InlineKeyboardButton(
+            f"📢 {d['label']}",
+            callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}"
+        )])
     buttons.append([InlineKeyboardButton("➕ Add by Chat ID", callback_data=_DADD_FETCH)])
     return InlineKeyboardMarkup(buttons)
 
@@ -525,12 +550,10 @@ def _detail_keyboard(chat_id: str) -> InlineKeyboardMarkup:
 def _pick_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
     for d in dests:
-        buttons.append([
-            InlineKeyboardButton(
-                f"📢 {d['label']}",
-                callback_data=f"{_DEST_PREFIX}{d['chat_id']}",
-            )
-        ])
+        buttons.append([InlineKeyboardButton(
+            f"📢 {d['label']}",
+            callback_data=f"{_DEST_PREFIX}{d['chat_id']}"
+        )])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -542,8 +565,9 @@ async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dests else
         "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
     )
-    await update.message.reply_text(text, reply_markup=_manage_keyboard(dests),
-                                    parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        text, reply_markup=_manage_keyboard(dests), parse_mode=ParseMode.MARKDOWN
+    )
     return ADD_DEST_PICK
 
 
@@ -573,8 +597,9 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
         )
-        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests),
-                                      parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(
+            text, reply_markup=_manage_keyboard(dests), parse_mode=ParseMode.MARKDOWN
+        )
         return ADD_DEST_PICK
 
     if data == "dback":
@@ -584,8 +609,9 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
         )
-        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests),
-                                      parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(
+            text, reply_markup=_manage_keyboard(dests), parse_mode=ParseMode.MARKDOWN
+        )
         return ADD_DEST_PICK
 
     if data == _DADD_FETCH:
@@ -666,8 +692,7 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await client.is_user_authorized():
         await client.disconnect()
         await update.message.reply_text(
-            "❌ You're not logged in. Use /login first.",
-            parse_mode=ParseMode.MARKDOWN,
+            "❌ You're not logged in. Use /login first.", parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
 
@@ -687,7 +712,6 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bare_id = int(numeric[3:])
         elif numeric.isdigit():
             bare_id = int(numeric)
-
         if bare_id is not None:
             from telethon.tl.types import InputPeerChannel
             try:
@@ -760,7 +784,6 @@ async def _show_scrape_dest_picker(update, context, user_id):
         lines.append(f"*{i}.* {d['label']}  (`{d['chat_id']}`)")
     lines += ["", "Reply with the *number* of your choice, or /cancel to abort."]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    return True
 
 
 async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -772,8 +795,7 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if start_id is None or end_id is None or channel_id is None:
         await update.message.reply_text(
-            "❌ *Session lost* — please run /scrape again.",
-            parse_mode=ParseMode.MARKDOWN,
+            "❌ *Session lost* — please run /scrape again.", parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
 
@@ -799,10 +821,9 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⚠️ _Safe delays active to avoid Telegram rate limits._",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    task = asyncio.create_task(run_scrape(
-        context.bot, user_id, channel_id, start_id, end_id, dest
-    ))
+    task = asyncio.create_task(
+        run_scrape(context.bot, user_id, channel_id, start_id, end_id, dest)
+    )
     scrape_tasks_by_user = context.application.bot_data.setdefault("scrape_tasks_by_user", {})
     scrape_tasks_by_user[user_id] = task
     task.add_done_callback(lambda t: scrape_tasks_by_user.pop(user_id, None))
@@ -817,8 +838,7 @@ async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_doc = await get_user(user_id)
     if not user_doc.get("session_string"):
         await update.message.reply_text(
-            "❌ *Not logged in.*\n\nUse /login first.",
-            parse_mode=ParseMode.MARKDOWN
+            "❌ *Not logged in.*\n\nUse /login first.", parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
     try:
@@ -826,18 +846,15 @@ async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await client.is_user_authorized():
             await client.disconnect()
             await update.message.reply_text(
-                "❌ *Session expired.*\n\nPlease /login again.",
-                parse_mode=ParseMode.MARKDOWN
+                "❌ *Session expired.*\n\nPlease /login again.", parse_mode=ParseMode.MARKDOWN
             )
             return ConversationHandler.END
         await client.disconnect()
     except Exception:
         await update.message.reply_text(
-            "❌ *Session error.*\n\nPlease /login again.",
-            parse_mode=ParseMode.MARKDOWN
+            "❌ *Session error.*\n\nPlease /login again.", parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
-
     context.user_data["scrape_user_id"] = user_id
     await update.message.reply_text(
         "🚀 *Scrape*\n\n"
@@ -920,6 +937,10 @@ async def _cleanup_image(image_path: Optional[str]):
 
 
 async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
+    """
+    Fetch FETCH_AHEAD IDs at a time, push onto bounded queue.
+    Blocks on queue.put() when full — keeps RAM flat regardless of range size.
+    """
     total = len(msg_ids)
     try:
         for slice_start in range(0, total, FETCH_AHEAD):
@@ -936,8 +957,7 @@ async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
                 print(f"  ⚠️  Fetch error {slice_ids[0]}-{slice_ids[-1]}: {e}")
                 fetched = []
             resolved = sorted(
-                (m for m in fetched if m is not None),
-                key=lambda m: m.id,
+                (m for m in fetched if m is not None), key=lambda m: m.id
             )
             del fetched
             for msg in resolved:
@@ -955,8 +975,8 @@ async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
 async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
                                    sent_as_image_for_poll: set, client):
     """
-    Send prev_msg as a standalone image if it is an image that was
-    never claimed by a poll.
+    If prev_msg is an image never claimed by a poll, send it as standalone.
+    Called at the top of every non-poll handler and when a new image arrives.
     """
     if (
         prev_msg is not None
@@ -968,12 +988,7 @@ async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
         if img_path:
             caption = (prev_msg.text or "").strip()
             try:
-                with open(img_path, "rb") as f:
-                    await safe_send(bot.send_photo(
-                        chat_id = dest_chat_id,
-                        photo   = f,
-                        caption = caption[:1024] if caption else None,
-                    ))
+                await safe_send_photo(bot, dest_chat_id, img_path, caption=caption or None)
             except Exception as e:
                 print(f"  ❌  Standalone image flush failed {prev_msg.id}: {e}")
             finally:
@@ -983,23 +998,23 @@ async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
 
 async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
     """
-    Memory-safe rolling scrape with Telegram-safe rate limiting.
+    Memory-safe rolling scrape with correct image ordering.
 
     Image pairing rules
     ───────────────────
-    When a poll arrives and prev_msg is an image:
-      • gap == 1  → always paired  (image posted immediately before poll)
-      • poll has no question text → always paired  (image IS the question)
-      • gap > 1 AND poll has question → NOT paired, flush image as standalone first
+    • gap == 1  → always paired (image immediately before poll)
+    • poll has no question text → always paired (image IS the question)
+    • gap > 1 AND poll has question → NOT paired, flush image as standalone
 
-    When two images arrive back-to-back:
-      • The first image is flushed as standalone before storing the second.
-      • This handles: question_img → poll → explanation_img → question_img → poll
+    Two consecutive images
+    ──────────────────────
+    • First image flushed as standalone before storing second.
+    • Handles: question_img → poll → explanation_img → question_img → poll
 
-    Rate limiting
-    ─────────────
-    smart_delay() — randomised 4-7 s + 25-35 s burst pause every 10 sends
-    safe_send()   — auto-retry on RetryAfter / TimedOut / NetworkError
+    No out-of-order sends
+    ─────────────────────
+    • safe_send_photo() uses 60s timeout so photos complete on first attempt.
+    • Poll is only sent AFTER image send fully returns.
     """
     global _send_counter
     _send_counter = 0
@@ -1022,7 +1037,8 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
         client = await get_client(user_id)
         if not await client.is_user_authorized():
             await safe_send(bot.send_message(
-                chat_id=dest_chat_id, text="❌ Session expired. /login again."))
+                chat_id=dest_chat_id, text="❌ Session expired. /login again."
+            ))
             await client.disconnect()
             return
 
@@ -1122,6 +1138,10 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     print(f"  ✔  Already answered: \"{poll_data['question'][:52]}\"")
 
                 # ── Image pairing decision ─────────────────────────────
+                # Image is paired when:
+                #   1. consecutive IDs (gap == 1)
+                #   2. poll has no question text (image IS the question)
+                # Otherwise flush image as standalone first.
                 reply_to_id   = None
                 image_caption = ""
 
@@ -1131,18 +1151,17 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     is_paired   = (id_gap == 1) or no_question
 
                     if is_paired:
-                        reason = "consecutive" if id_gap == 1 else "poll has no question"
-                        print(f"      🖼️  Pairing img {prev_msg.id} → poll {message.id} ({reason})")
-                        image_path    = await download_image(client, prev_msg, prev_msg.id)
+                        reason     = "consecutive" if id_gap == 1 else "poll has no question"
+                        image_path = await download_image(client, prev_msg, prev_msg.id)
                         image_caption = (prev_msg.text or "").strip()
+                        print(f"      🖼️  Pairing img {prev_msg.id} → poll {message.id} ({reason})")
                         if image_path:
                             try:
-                                with open(image_path, "rb") as f:
-                                    sent_photo = await safe_send(bot.send_photo(
-                                        chat_id = dest_chat_id,
-                                        photo   = f,
-                                        caption = image_caption[:1024] if image_caption else None,
-                                    ))
+                                # Image send fully completes before poll is sent
+                                sent_photo = await safe_send_photo(
+                                    bot, dest_chat_id, image_path,
+                                    caption=image_caption or None
+                                )
                                 reply_to_id = sent_photo.message_id
                                 sent_as_image_for_poll.add(prev_msg.id)
                                 await smart_delay()
@@ -1151,8 +1170,8 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                             finally:
                                 await _cleanup_image(image_path)
                     else:
-                        print(f"      🔀  img {prev_msg.id} gap={id_gap}, poll has question "
-                              f"→ standalone flush")
+                        print(f"      🔀  img {prev_msg.id} gap={id_gap}, "
+                              f"poll has question → standalone flush")
                         await _flush_standalone_image(
                             bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                         )
@@ -1214,16 +1233,12 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     prev_msg = message
                     continue
 
-                # ── It's an image ──────────────────────────────────────
-                # KEY FIX: if prev_msg is already an unclaimed image,
-                # flush it as standalone BEFORE storing the new image.
-                # This correctly handles:
-                #   question_img → poll → explanation_img → question_img → poll
-                # explanation_img is flushed here when question_img arrives.
+                # It's an image — flush previous image if unclaimed,
+                # then hold this one for the next message.
+                # This handles: explanation_img → question_img sequences.
                 await _flush_standalone_image(
                     bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                 )
-
                 print(f"      🖼️  Img #{message.id} — holding, waiting for next msg")
                 prev_msg = message
                 continue
@@ -1355,12 +1370,8 @@ def read_closed_results(message, poll_data: dict) -> dict:
                     break
         answers.append(entry)
     is_quiz = poll_data.get("is_quiz", False)
-    if is_quiz:
-        correct = get_correct_index(poll, results)
-        print(f"      ✅  Closed quiz — correct: option {correct+1 if correct is not None else '?'}")
-    else:
-        correct = get_max_votes_index(poll, results)
-        print(f"      📊  Closed poll — top: option {correct+1 if correct is not None else '?'}")
+    correct = get_correct_index(poll, results) if is_quiz else get_max_votes_index(poll, results)
+    print(f"      {'✅' if is_quiz else '📊'}  Closed — answer: option {correct+1 if correct is not None else '?'}")
     poll_data["answers"]              = answers
     poll_data["correct_answer_index"] = correct
     poll_data["total_voters"]         = results.total_voters if results else None
@@ -1385,7 +1396,7 @@ def get_correct_index(poll, results) -> Optional[int]:
 def get_max_votes_index(poll, results) -> Optional[int]:
     if not results or not results.results:
         return None
-    best_i = best_voters = None
+    best_i      = None
     best_voters = -1
     for res in results.results:
         v = res.voters or 0
@@ -1481,12 +1492,9 @@ async def auto_vote_and_reveal(client, entity, message, poll_data: dict) -> dict
                     break
         updated_answers.append(entry)
 
-    if is_quiz:
-        correct = get_correct_index(up, ures)
-        print(f"      ✅  Correct: option {correct+1 if correct is not None else '?'}")
-    else:
-        correct = get_max_votes_index(up, ures)
-        print(f"      📊  Top: option {correct+1 if correct is not None else '?'}")
+    correct = (get_correct_index(up, ures) if is_quiz
+               else get_max_votes_index(up, ures))
+    print(f"      {'✅' if is_quiz else '📊'}  Answer: option {correct+1 if correct is not None else '?'}")
 
     poll_data["answers"]              = updated_answers
     poll_data["correct_answer_index"] = correct
@@ -1537,13 +1545,10 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
         img     = quiz.get("image_path")
         try:
             if img and os.path.exists(img):
-                with open(img, "rb") as f:
-                    await safe_send(bot.send_photo(
-                        chat_id    = chat_id,
-                        photo      = f,
-                        caption    = image_caption[:1024] if image_caption else caption,
-                        parse_mode = None if image_caption else ParseMode.MARKDOWN_V2,
-                    ))
+                await safe_send_photo(
+                    bot, chat_id, img,
+                    caption=image_caption or caption
+                )
             else:
                 await safe_send(bot.send_message(
                     chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2
@@ -1557,7 +1562,7 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
     explanation  = (quiz.get("explanation") or "")[:200]
     is_quiz_type = quiz.get("is_quiz", True)
 
-    # Telegram requires a non-empty question
+    # Telegram requires non-empty question
     if not question.strip() or question.strip() == ".":
         question = "❓"
 
@@ -1677,6 +1682,13 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(HTTPXRequest(
+            connection_pool_size = 8,
+            read_timeout         = 60,
+            write_timeout        = 60,
+            connect_timeout      = 30,
+            pool_timeout         = 30,
+        ))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
