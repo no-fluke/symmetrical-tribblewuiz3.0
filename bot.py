@@ -254,6 +254,24 @@ def _poll_has_no_question(poll_data: dict) -> bool:
     return q == "" or q == "."
 
 
+def _image_is_paired_with_poll(prev_msg, poll_msg, poll_data: dict) -> bool:
+    """
+    Decide whether prev_msg (an image) belongs to poll_msg.
+
+    Paired when ANY of:
+      1. IDs are consecutive (gap == 1) — image posted immediately before poll
+      2. Poll has no real question text — image IS the question
+
+    Not paired when:
+      - ID gap > 1 AND poll has a real question text
+    """
+    if prev_msg is None:
+        return False
+    id_gap      = poll_msg.id - prev_msg.id
+    no_question = _poll_has_no_question(poll_data)
+    return id_gap == 1 or no_question
+
+
 # =================== BOT COMMANDS ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1335,11 +1353,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
 
 
 # ================== POLL HELPERS =================
-
-def _poll_has_no_question(poll_data: dict) -> bool:
-    q = (poll_data.get("question") or "").strip()
-    return q == "" or q == "."
-
 
 def is_unattempted(media: MessageMediaPoll) -> bool:
     results = media.results
