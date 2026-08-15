@@ -10,6 +10,7 @@ import aiohttp
 from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -55,21 +56,57 @@ API_ID = int(API_ID)
 IMAGE_DIR = "quiz_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# ======================== DELAYS =========================
-SEND_DELAY    = 3.0
-VOTE_DELAY    = 2.5
-AUTO_VOTE     = True
-OUTPUT_JSON   = "quiz_output.json"
-OUTPUT_TXT    = "quiz_output.txt"
+# ===================== RATE LIMITS =======================
+SEND_DELAY_MIN  = 4.0
+SEND_DELAY_MAX  = 7.0
+BURST_EVERY     = 10
+BURST_PAUSE_MIN = 25.0
+BURST_PAUSE_MAX = 35.0
 
-# Self-ping to keep Render free tier alive
+VOTE_DELAY  = 2.5
+AUTO_VOTE   = True
+
+OUTPUT_JSON = "quiz_output.json"
+OUTPUT_TXT  = "quiz_output.txt"
+
 RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "")
 PING_INTERVAL = 20
 PING_PORT     = int(os.getenv("PORT", "10000"))
 
-# Rolling buffer — never more than this many message objects in RAM at once
-BUFFER_SIZE   = 100
-FETCH_AHEAD   = 100   # how many IDs to fetch per MTProto call
+BUFFER_SIZE = 100
+FETCH_AHEAD = 100
+
+_send_counter = 0
+
+
+# ================== RATE-LIMIT HELPERS ===================
+
+async def smart_delay():
+    global _send_counter
+    _send_counter += 1
+    if _send_counter % BURST_EVERY == 0:
+        pause = random.uniform(BURST_PAUSE_MIN, BURST_PAUSE_MAX)
+        print(f"  ⏸️  Burst pause after {_send_counter} sends ({pause:.1f}s)…")
+        await asyncio.sleep(pause)
+    else:
+        await asyncio.sleep(random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX))
+
+
+async def safe_send(coro, retries: int = 6):
+    for attempt in range(retries):
+        try:
+            return await coro
+        except RetryAfter as e:
+            wait = e.retry_after + random.uniform(5, 15)
+            print(f"  ⚠️  Rate-limit: retry_after={e.retry_after}s → sleeping {wait:.1f}s")
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            wait = (2 ** attempt) + random.uniform(1, 5)
+            print(f"  ⚠️  Network error ({e}), retry {attempt+1}/{retries} in {wait:.1f}s")
+            await asyncio.sleep(wait)
+        except Exception:
+            raise
+    raise RuntimeError(f"safe_send failed after {retries} attempts")
 
 
 # ================== TELETHON SESSION HELPER ==============
@@ -146,6 +183,55 @@ def build_bot_caption(quiz: dict, number: int) -> str:
     return "\n".join(lines)
 
 
+def format_quiz_text(quiz: dict, number: int) -> str:
+    lines = [
+        "="*60,
+        f"Quiz #{number}  |  ID: {quiz['message_id']}  |  {quiz['date']}"
+        + ("  [auto-voted]" if quiz.get("auto_voted") else ""),
+        "="*60,
+        f"Q: {quiz['question']}\n",
+    ]
+    for ans in quiz["answers"]:
+        marker = ""
+        if quiz["correct_answer_index"] is not None:
+            marker = " ✅" if ans["index"] == quiz["correct_answer_index"] else " ❌"
+        voters = f"  [{ans.get('voters','?')} votes]" if ans.get("voters") is not None else ""
+        lines.append(f"  {ans['index']+1}. {ans['text']}{marker}{voters}")
+    if quiz.get("explanation"):
+        lines.append(f"\n💡 {quiz['explanation']}")
+    if quiz.get("image_path"):
+        lines.append(f"\n🖼️  Image: {quiz['image_path']}")
+    if quiz.get("caption"):
+        lines.append(f"\n📝 Caption: {quiz['caption']}")
+    if quiz.get("image_caption"):
+        lines.append(f"\n🖼️ Image caption: {quiz['image_caption']}")
+    lines.append(
+        f"\nType: {'Quiz' if quiz['is_quiz'] else 'Poll'} | "
+        f"Total voters: {quiz['total_voters'] or 'N/A'}"
+    )
+    return "\n".join(lines)
+
+
+def _poll_has_no_question(poll_data: dict) -> bool:
+    """True when poll question is empty/placeholder — image IS the question."""
+    q = (poll_data.get("question") or "").strip()
+    return q == "" or q == "."
+
+
+def _image_is_paired_with_poll(prev_msg, poll_msg, poll_data: dict) -> bool:
+    """
+    Paired when:
+      1. IDs are consecutive (gap == 1) — image posted immediately before poll
+      2. Poll has no real question text — image IS the question
+    Not paired when gap > 1 AND poll has a real question.
+    """
+    if prev_msg is None:
+        return False
+    id_gap      = poll_msg.id - prev_msg.id
+    no_question = _poll_has_no_question(poll_data)
+    return id_gap == 1 or no_question
+
+
 # =================== BOT COMMANDS ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +281,6 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_doc.get("session_string"):
         await update.message.reply_text("❌ You are not logged in.")
         return
-
     try:
         client = await get_client(user_id)
         if await client.is_user_authorized():
@@ -204,7 +289,6 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await client.disconnect()
     except Exception:
         pass
-
     await set_user_field(user_id, "session_string", "")
     await _cleanup_login_state(user_id)
     await update.message.reply_text(
@@ -233,7 +317,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Not logged in. Use /login to authenticate.")
 
 
-# ---------------- LOGIN STATE (in-memory) ----------------
 LOGIN_STATE = {}
 
 
@@ -248,11 +331,8 @@ async def _cleanup_login_state(user_id: str):
                 pass
 
 
-# ---------------- LOGIN CONVERSATION --------------------
-
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-
+    user_id  = str(update.effective_user.id)
     user_doc = await get_user(user_id)
     if user_doc.get("session_string"):
         try:
@@ -266,10 +346,8 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await client.disconnect()
         except Exception:
             pass
-
     await _cleanup_login_state(user_id)
     LOGIN_STATE[user_id] = {"step": "WAITING_PHONE", "data": {}}
-
     await update.message.reply_text(
         "📱 *Login — Step 1 of 3*\n\n"
         "Send your phone number with country code.\n\n"
@@ -282,26 +360,18 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    phone = update.message.text.strip().replace(" ", "")
-
+    phone   = update.message.text.strip().replace(" ", "")
     if not re.match(r"^\+\d{7,15}$", phone):
         await update.message.reply_text("❌ Invalid format. Use +1234567890.")
         return LOGIN_PHONE
-
     await update.message.reply_text("📩 Sending OTP...")
-
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-
     try:
         sent = await client.send_code_request(phone)
         LOGIN_STATE[user_id] = {
             "step": "WAITING_CODE",
-            "data": {
-                "client": client,
-                "phone":  phone,
-                "hash":   sent.phone_code_hash,
-            }
+            "data": {"client": client, "phone": phone, "hash": sent.phone_code_hash}
         }
         await set_user_field(user_id, "phone_number", phone)
         await update.message.reply_text(
@@ -312,7 +382,6 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return LOGIN_OTP
-
     except PhoneNumberInvalidError:
         await client.disconnect()
         del LOGIN_STATE[user_id]
@@ -327,36 +396,29 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    otp = update.message.text.strip().replace(" ", "")
-
+    otp     = update.message.text.strip().replace(" ", "")
     if not otp.isdigit():
         await update.message.reply_text("❌ Send only the numeric code.")
         return LOGIN_OTP
-
     state = LOGIN_STATE.get(user_id)
     if not state or state["step"] != "WAITING_CODE":
         await update.message.reply_text("❌ Session lost. Please /login again.")
         return ConversationHandler.END
-
-    client       = state["data"]["client"]
-    phone        = state["data"]["phone"]
-    phone_hash   = state["data"]["hash"]
-
+    client     = state["data"]["client"]
+    phone      = state["data"]["phone"]
+    phone_hash = state["data"]["hash"]
     try:
         await client.sign_in(phone, otp, phone_code_hash=phone_hash)
         await _finalize_login(update, client, user_id)
         return ConversationHandler.END
-
     except PhoneCodeInvalidError:
         await update.message.reply_text("❌ OTP is incorrect. Try again.")
         return LOGIN_OTP
-
     except PhoneCodeExpiredError:
         await client.disconnect()
         del LOGIN_STATE[user_id]
         await update.message.reply_text("❌ OTP expired. Please /login again.")
         return ConversationHandler.END
-
     except SessionPasswordNeededError:
         LOGIN_STATE[user_id]["step"] = "WAITING_PASSWORD"
         await update.message.reply_text(
@@ -367,7 +429,6 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return LOGIN_2FA
-
     except Exception as e:
         await client.disconnect()
         del LOGIN_STATE[user_id]
@@ -378,23 +439,18 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = str(update.effective_user.id)
     password = update.message.text.strip()
-
-    state = LOGIN_STATE.get(user_id)
+    state    = LOGIN_STATE.get(user_id)
     if not state or state["step"] != "WAITING_PASSWORD":
         await update.message.reply_text("❌ Session lost. Please /login again.")
         return ConversationHandler.END
-
     client = state["data"]["client"]
-
     try:
         await client.sign_in(password=password)
         await _finalize_login(update, client, user_id)
         return ConversationHandler.END
-
     except PasswordHashInvalidError:
         await update.message.reply_text("❌ Wrong password. Try again.")
         return LOGIN_2FA
-
     except Exception as e:
         await client.disconnect()
         del LOGIN_STATE[user_id]
@@ -453,12 +509,8 @@ async def _remove_destination(user_id: str, chat_id) -> list[dict]:
 def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
     for d in dests:
-        buttons.append([
-            InlineKeyboardButton(
-                f"📢 {d['label']}",
-                callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}",
-            )
-        ])
+        buttons.append([InlineKeyboardButton(f"📢 {d['label']}",
+                        callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}")])
     buttons.append([InlineKeyboardButton("➕ Add by Chat ID", callback_data=_DADD_FETCH)])
     return InlineKeyboardMarkup(buttons)
 
@@ -466,7 +518,7 @@ def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
 def _detail_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗑 Remove", callback_data=f"{_RDEST_PREFIX}{chat_id}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="dback")],
+        [InlineKeyboardButton("⬅️ Back",  callback_data="dback")],
     ])
 
 
@@ -490,11 +542,8 @@ async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dests else
         "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
     )
-    await update.message.reply_text(
-        text,
-        reply_markup=_manage_keyboard(dests),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text(text, reply_markup=_manage_keyboard(dests),
+                                    parse_mode=ParseMode.MARKDOWN)
     return ADD_DEST_PICK
 
 
@@ -524,11 +573,8 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
         )
-        await query.edit_message_text(
-            text,
-            reply_markup=_manage_keyboard(dests),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests),
+                                      parse_mode=ParseMode.MARKDOWN)
         return ADD_DEST_PICK
 
     if data == "dback":
@@ -538,33 +584,29 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
         )
-        await query.edit_message_text(
-            text,
-            reply_markup=_manage_keyboard(dests),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests),
+                                      parse_mode=ParseMode.MARKDOWN)
         return ADD_DEST_PICK
 
     if data == _DADD_FETCH:
         await query.edit_message_text(
             "➕ *Add destination*\n\n"
             "You can add a destination in *two ways*:\n\n"
-            "1️⃣ *Forward any message* from the channel/group to this chat — the bot will detect it automatically.\n\n"
+            "1️⃣ *Forward any message* from the channel/group to this chat.\n\n"
             "2️⃣ *Type the ID or @username* manually:\n"
-            "• `-1001234567890`\n"
-            "• `@mychannelname`\n\n"
+            "• `-1001234567890`\n• `@mychannelname`\n\n"
             "Or /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ADD_DEST_TYPED
 
     if data.startswith(_DADD_PREFIX):
-        payload   = data[len(_DADD_PREFIX):]
-        colon     = payload.index(":")
-        chat_id   = payload[:colon]
-        label     = payload[colon + 1:].replace("｜", ":")
-        dests     = await _add_destination(user_id, label, chat_id)
-        text      = (
+        payload = data[len(_DADD_PREFIX):]
+        colon   = payload.index(":")
+        chat_id = payload[:colon]
+        label   = payload[colon + 1:].replace("｜", ":")
+        dests   = await _add_destination(user_id, label, chat_id)
+        text    = (
             "📬 *Destinations*\n\nTap a destination to view or remove it."
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
@@ -578,10 +620,9 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    msg     = update.message
-
-    fwd = msg.forward_origin if hasattr(msg, "forward_origin") else None
+    user_id  = str(update.effective_user.id)
+    msg      = update.message
+    fwd      = msg.forward_origin if hasattr(msg, "forward_origin") else None
     fwd_chat = None
     if fwd is not None:
         fwd_chat = getattr(fwd, "chat", None)
@@ -592,20 +633,21 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_id    = fwd_chat.id
         chat_type = fwd_chat.type
         if chat_type in ("channel", "supergroup"):
-            abs_str = str(abs(raw_id))
+            abs_str     = str(abs(raw_id))
             chat_id_str = "-" + (abs_str if abs_str.startswith("100") else "100" + abs_str)
         else:
             chat_id_str = str(raw_id)
-        title = (getattr(fwd_chat, "title", None) or getattr(fwd_chat, "username", None) or chat_id_str)[:40]
-
+        title = (getattr(fwd_chat, "title", None) or
+                 getattr(fwd_chat, "username", None) or chat_id_str)[:40]
         dests = await _add_destination(user_id, title, chat_id_str)
-        text = (
+        text  = (
             "📬 *Destinations*\n\nTap a destination to view or remove it."
             if dests else
             "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
         )
         await msg.reply_text(
-            f"✅ *{escape_md(title)}* added\\!\n`{chat_id_str}`\n\n" + escape_md(text.split("\n\n", 1)[1]),
+            f"✅ *{escape_md(title)}* added\\!\n`{chat_id_str}`\n\n"
+            + escape_md(text.split("\n\n", 1)[1]),
             reply_markup=_manage_keyboard(dests),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
@@ -620,19 +662,18 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_DEST_TYPED
 
     await msg.reply_text("🔍 Looking up the chat…")
-
     client = await get_client(user_id)
     if not await client.is_user_authorized():
         await client.disconnect()
         await update.message.reply_text(
-            "❌ You're not logged in. Use /login first, then try /set\\_destination again.",
+            "❌ You're not logged in. Use /login first.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
 
-    entity = None
+    entity      = None
     chat_id_str = None
-    title = None
+    title       = None
 
     try:
         entity = await client.get_entity(raw_text)
@@ -641,19 +682,19 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if entity is None:
         numeric = raw_text.lstrip("-")
+        bare_id = None
         if numeric.startswith("100") and len(numeric) > 10:
             bare_id = int(numeric[3:])
-        else:
-            bare_id = int(numeric) if numeric.isdigit() else None
+        elif numeric.isdigit():
+            bare_id = int(numeric)
 
         if bare_id is not None:
             from telethon.tl.types import InputPeerChannel
             try:
-                peer = InputPeerChannel(channel_id=bare_id, access_hash=0)
+                peer   = InputPeerChannel(channel_id=bare_id, access_hash=0)
                 entity = await client.get_entity(peer)
             except Exception:
                 pass
-
             if entity is None:
                 try:
                     target_id = int(raw_text)
@@ -670,17 +711,15 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stripped = raw_text.lstrip("-")
         if stripped.isdigit():
             chat_id_str = raw_text
-            title = raw_text[:40]
+            title       = raw_text[:40]
             await update.message.reply_text(
-                f"⚠️ Could not auto-resolve the chat name (your account may not have joined it yet), "
-                f"but the ID `{raw_text}` looks valid and has been saved.\n\n"
-                "If sending fails later, make sure your account is a member of that chat.",
+                f"⚠️ Could not auto-resolve the chat name, "
+                f"but the ID `{raw_text}` looks valid and has been saved.",
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
             await update.message.reply_text(
                 f"❌ Could not find that chat: `{raw_text}`\n\n"
-                "Make sure the ID is correct and your account has access to that chat.\n\n"
                 "Send another ID or /cancel to abort.",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -694,10 +733,11 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id_str = str(int("-100" + str(raw_id)))
         else:
             chat_id_str = str(raw_id)
-        title = (getattr(entity, "title", None) or getattr(entity, "username", None) or raw_text)[:40]
+        title = (getattr(entity, "title", None) or
+                 getattr(entity, "username", None) or raw_text)[:40]
 
     dests = await _add_destination(user_id, title, chat_id_str)
-    text = (
+    text  = (
         "📬 *Destinations*\n\nTap a destination to view or remove it."
         if dests else
         "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
@@ -710,37 +750,29 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Scrape destination picker ----------
-
-async def _show_scrape_dest_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                    user_id: str) -> bool:
-    dests  = await _get_destinations(user_id)
-    target = update.message
-
+async def _show_scrape_dest_picker(update, context, user_id):
+    dests     = await _get_destinations(user_id)
     bot_chat  = {"label": "🤖 This chat (bot)", "chat_id": str(update.effective_user.id)}
     full_list = [bot_chat] + list(dests)
     context.user_data["dest_list"] = full_list
-
     lines = ["📬 *Where should the results be sent?*", ""]
     for i, d in enumerate(full_list, 1):
         lines.append(f"*{i}.* {d['label']}  (`{d['chat_id']}`)")
     lines += ["", "Reply with the *number* of your choice, or /cancel to abort."]
-
-    await target.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     return True
 
 
 async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw   = update.message.text.strip()
-    dests = context.user_data.get("dest_list", [])
-
+    raw        = update.message.text.strip()
+    dests      = context.user_data.get("dest_list", [])
     start_id   = context.user_data.get("start_id")
     end_id     = context.user_data.get("end_id")
     channel_id = context.user_data.get("channel_id")
 
     if start_id is None or end_id is None or channel_id is None:
         await update.message.reply_text(
-            "❌ *Session lost* — the bot may have restarted.\n\nPlease run /scrape again.",
+            "❌ *Session lost* — please run /scrape again.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
@@ -752,20 +784,22 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return SCRAPE_DEST
 
-    chosen = dests[int(raw) - 1]
-    label  = chosen["label"]
-    dest   = int(chosen["chat_id"])
-    total  = end_id - start_id + 1
+    chosen  = dests[int(raw) - 1]
+    label   = chosen["label"]
+    dest    = int(chosen["chat_id"])
+    total   = end_id - start_id + 1
+    user_id = context.user_data.get("scrape_user_id", str(update.effective_user.id))
 
     await update.message.reply_text(
         f"✅ *Sending to:* {label}\n\n"
         "⏳ *Scrape started!*\n\n"
         f"📡 Channel: `{channel_id}`\n"
         f"📨 Range: `{start_id}` → `{end_id}` ({total} messages)\n\n"
-        "I\'ll notify you here when it\'s done.",
+        "I\'ll notify you here when it\'s done.\n\n"
+        "⚠️ _Safe delays active to avoid Telegram rate limits._",
         parse_mode=ParseMode.MARKDOWN,
     )
-    user_id = context.user_data.get("scrape_user_id", str(update.effective_user.id))
+
     task = asyncio.create_task(run_scrape(
         context.bot, user_id, channel_id, start_id, end_id, dest
     ))
@@ -778,18 +812,15 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-# ---------------- SCRAPE CONVERSATION --------------------
-
 async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    user_id  = str(update.effective_user.id)
     user_doc = await get_user(user_id)
     if not user_doc.get("session_string"):
         await update.message.reply_text(
-            "❌ *Not logged in.*\n\nUse /login to connect your Telegram account first.",
+            "❌ *Not logged in.*\n\nUse /login first.",
             parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
-
     try:
         client = await get_client(user_id)
         if not await client.is_user_authorized():
@@ -810,7 +841,7 @@ async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["scrape_user_id"] = user_id
     await update.message.reply_text(
         "🚀 *Scrape*\n\n"
-        "Paste the *start message link* (first quiz in the range).\n\n"
+        "Paste the *start message link*.\n\n"
         "📎 Example:\n`https://t.me/c/1234567890/42`\n\n"
         "Or /cancel to abort.",
         parse_mode=ParseMode.MARKDOWN
@@ -819,13 +850,11 @@ async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
+    link   = update.message.text.strip()
     parsed = parse_private_link(link)
     if not parsed:
         await update.message.reply_text(
-            "❌ *Couldn't read that link.*\n\n"
-            "Make sure it looks like:\n`https://t.me/c/1234567890/42`\n\n"
-            "Try again or /cancel to abort.",
+            "❌ *Couldn't read that link.*\n\nTry again or /cancel.",
             parse_mode=ParseMode.MARKDOWN
         )
         return SCRAPE_START_LINK
@@ -833,8 +862,7 @@ async def scrape_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["start_id"]   = parsed[1]
     await update.message.reply_text(
         f"✅ Start set \\(ID: `{parsed[1]}`\\)\n\n"
-        "Now paste the *end message link* \\(last quiz in the range\\)\\.\n\n"
-        "📎 Example:\n`https://t.me/c/1234567890/99`\n\n"
+        "Now paste the *end message link*\\.\n\n"
         "Or /cancel to abort\\.",
         parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -844,25 +872,21 @@ async def scrape_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scrape_end_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "start_id" not in context.user_data:
         return await scrape_start_link(update, context)
-
-    link = update.message.text.strip()
+    link   = update.message.text.strip()
     parsed = parse_private_link(link)
     if not parsed:
         await update.message.reply_text(
-            "❌ *Couldn't read that link.*\n\n"
-            "Make sure it looks like:\n`https://t.me/c/1234567890/99`\n\nTry again or /cancel.",
+            "❌ *Couldn't read that link.*\n\nTry again or /cancel.",
             parse_mode=ParseMode.MARKDOWN
         )
         return SCRAPE_END_LINK
-
     channel_id = context.user_data["channel_id"]
     if parsed[0] != channel_id:
         await update.message.reply_text(
-            "❌ *Wrong channel.*\n\nThe end link must be from the same channel. Try again or /cancel.",
+            "❌ *Wrong channel.*\n\nEnd link must be from the same channel.",
             parse_mode=ParseMode.MARKDOWN
         )
         return SCRAPE_END_LINK
-
     end_id   = parsed[1]
     start_id = context.user_data["start_id"]
     if end_id < start_id:
@@ -871,45 +895,12 @@ async def scrape_end_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return SCRAPE_END_LINK
-
     context.user_data["end_id"] = end_id
-    user_id = context.user_data["scrape_user_id"]
-    await _show_scrape_dest_picker(update, context, user_id)
+    await _show_scrape_dest_picker(update, context, context.user_data["scrape_user_id"])
     return SCRAPE_DEST
 
 
-# ==================== FORMAT HELPERS ===================
-
-def format_quiz_text(quiz: dict, number: int) -> str:
-    lines = [
-        "="*60,
-        f"Quiz #{number}  |  ID: {quiz['message_id']}  |  {quiz['date']}"
-        + ("  [auto-voted]" if quiz.get("auto_voted") else ""),
-        "="*60,
-        f"Q: {quiz['question']}\n",
-    ]
-    for ans in quiz["answers"]:
-        marker = ""
-        if quiz["correct_answer_index"] is not None:
-            marker = " ✅" if ans["index"] == quiz["correct_answer_index"] else " ❌"
-        voters = f"  [{ans.get('voters','?')} votes]" if ans.get("voters") is not None else ""
-        lines.append(f"  {ans['index']+1}. {ans['text']}{marker}{voters}")
-    if quiz.get("explanation"):
-        lines.append(f"\n💡 {quiz['explanation']}")
-    if quiz.get("image_path"):
-        lines.append(f"\n🖼️  Image: {quiz['image_path']}")
-    if quiz.get("caption"):
-        lines.append(f"\n📝 Caption: {quiz['caption']}")
-    if quiz.get("image_caption"):
-        lines.append(f"\n🖼️ Image caption: {quiz['image_caption']}")
-    lines.append(
-        f"\nType: {'Quiz' if quiz['is_quiz'] else 'Poll'} | "
-        f"Total voters: {quiz['total_voters'] or 'N/A'}"
-    )
-    return "\n".join(lines)
-
-
-# ==================== BACKGROUND SCRAPING =================
+# ==================== SCRAPING INTERNALS ==================
 
 def _is_image_message(message) -> bool:
     if isinstance(message.media, MessageMediaPhoto):
@@ -928,76 +919,44 @@ async def _cleanup_image(image_path: Optional[str]):
             print(f"      ⚠️  Could not delete temp image {image_path}: {e}")
 
 
-# -----------------------------------------------------------------------
-# Rolling-buffer fetcher
-# -----------------------------------------------------------------------
-# The producer coroutine fetches FETCH_AHEAD IDs at a time and puts each
-# resolved message onto an asyncio.Queue capped at BUFFER_SIZE.
-# The consumer (run_scrape) pulls one message at a time — memory never
-# exceeds BUFFER_SIZE objects regardless of the total range.
-# -----------------------------------------------------------------------
-
-async def _fetch_producer(
-    client,
-    entity,
-    msg_ids: list,
-    queue: asyncio.Queue,
-    stop_event: asyncio.Event,
-):
-    """
-    Fetch messages in FETCH_AHEAD-sized slices and push them onto `queue`
-    in ascending ID order.  Puts None as a sentinel when done (or on cancel).
-    """
+async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
     total = len(msg_ids)
     try:
         for slice_start in range(0, total, FETCH_AHEAD):
             if stop_event.is_set():
                 break
-
             slice_ids = msg_ids[slice_start : slice_start + FETCH_AHEAD]
             print(f"  📦  Fetching IDs {slice_ids[0]}–{slice_ids[-1]} "
-                  f"({len(slice_ids)} msgs, "
-                  f"queue depth: {queue.qsize()}/{BUFFER_SIZE})…")
-
+                  f"({len(slice_ids)} msgs, queue: {queue.qsize()}/{BUFFER_SIZE})…")
             try:
                 fetched = await client.get_messages(entity, ids=slice_ids)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"  ⚠️  Fetch error for slice {slice_ids[0]}-{slice_ids[-1]}: {e}")
+                print(f"  ⚠️  Fetch error {slice_ids[0]}-{slice_ids[-1]}: {e}")
                 fetched = []
-
-            # Sort within the slice before queuing so consumer sees them in order
             resolved = sorted(
                 (m for m in fetched if m is not None),
                 key=lambda m: m.id,
             )
             del fetched
-
             for msg in resolved:
                 if stop_event.is_set():
                     break
-                # put() blocks if queue is full — this is the back-pressure
-                # that keeps memory bounded: producer waits for consumer to
-                # drain before fetching more.
                 await queue.put(msg)
-
             del resolved
             gc.collect()
-
     except asyncio.CancelledError:
         pass
     finally:
-        # Always send sentinel so consumer knows we're done
         await queue.put(None)
 
 
-async def _flush_standalone_image(
-    bot, dest_chat_id, prev_msg, sent_as_image_for_poll: set, client
-):
+async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
+                                   sent_as_image_for_poll: set, client):
     """
-    If prev_msg is an image that was never claimed by a poll, send it now.
-    Called whenever a non-poll message follows an image message.
+    Send prev_msg as a standalone image if it is an image that was
+    never claimed by a poll.
     """
     if (
         prev_msg is not None
@@ -1010,45 +969,45 @@ async def _flush_standalone_image(
             caption = (prev_msg.text or "").strip()
             try:
                 with open(img_path, "rb") as f:
-                    await bot.send_photo(
+                    await safe_send(bot.send_photo(
                         chat_id = dest_chat_id,
                         photo   = f,
                         caption = caption[:1024] if caption else None,
-                    )
+                    ))
             except Exception as e:
                 print(f"  ❌  Standalone image flush failed {prev_msg.id}: {e}")
             finally:
                 await _cleanup_image(img_path)
-            await asyncio.sleep(SEND_DELAY)
+            await smart_delay()
 
 
-async def run_scrape(
-    bot,
-    user_id: str,
-    channel_id: int,
-    start_id: int,
-    end_id: int,
-    dest_chat_id,
-):
+async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
     """
-    Memory-safe rolling scrape.
+    Memory-safe rolling scrape with Telegram-safe rate limiting.
 
-    Architecture
-    ────────────
-    • Producer task fetches FETCH_AHEAD IDs at a time and pushes resolved
-      message objects onto a bounded asyncio.Queue (max BUFFER_SIZE deep).
-    • Consumer (this coroutine) pulls one message at a time and processes it
-      immediately.
-    • Back-pressure: queue.put() in the producer blocks whenever the consumer
-      falls behind, so at most BUFFER_SIZE + FETCH_AHEAD message objects
-      ever exist simultaneously — typically ~200 objects ≈ 3 MB peak.
-    • prev_msg holds exactly one message for image→poll lookahead; it is
-      replaced on every iteration, so only 1 extra object exists at a time.
+    Image pairing rules
+    ───────────────────
+    When a poll arrives and prev_msg is an image:
+      • gap == 1  → always paired  (image posted immediately before poll)
+      • poll has no question text → always paired  (image IS the question)
+      • gap > 1 AND poll has question → NOT paired, flush image as standalone first
+
+    When two images arrive back-to-back:
+      • The first image is flushed as standalone before storing the second.
+      • This handles: question_img → poll → explanation_img → question_img → poll
+
+    Rate limiting
+    ─────────────
+    smart_delay() — randomised 4-7 s + 25-35 s burst pause every 10 sends
+    safe_send()   — auto-retry on RetryAfter / TimedOut / NetworkError
     """
-    await bot.send_message(
+    global _send_counter
+    _send_counter = 0
+
+    await safe_send(bot.send_message(
         chat_id=dest_chat_id,
         text="⏳ Scraping started… quizzes will appear here as they are processed."
-    )
+    ))
 
     client     = None
     stop_event = asyncio.Event()
@@ -1062,17 +1021,18 @@ async def run_scrape(
     try:
         client = await get_client(user_id)
         if not await client.is_user_authorized():
-            await bot.send_message(chat_id=dest_chat_id, text="❌ Session expired. /login again.")
+            await safe_send(bot.send_message(
+                chat_id=dest_chat_id, text="❌ Session expired. /login again."))
             await client.disconnect()
             return
 
         try:
             entity = await client.get_entity(channel_id)
         except Exception as e:
-            await bot.send_message(
+            await safe_send(bot.send_message(
                 chat_id=dest_chat_id,
                 text=f"❌ Could not access channel: {e}\nMake sure you are a member."
-            )
+            ))
             await client.disconnect()
             return
 
@@ -1080,42 +1040,39 @@ async def run_scrape(
         msg_ids = list(range(start_id, end_id + 1))
         total   = len(msg_ids)
 
-        print(f"\n{'─'*58}")
-        print(f"  Channel    : {title}")
-        print(f"  Msg range  : {start_id} → {end_id} ({total} messages)")
-        print(f"  Buffer     : {BUFFER_SIZE} slots  |  Fetch ahead: {FETCH_AHEAD}")
-        print(f"  Auto-vote  : {'ON ⚡' if AUTO_VOTE else 'OFF'}")
-        print(f"  Dest chat  : {dest_chat_id}")
-        print(f"{'─'*58}\n")
+        print(f"\n{'─'*60}")
+        print(f"  Channel   : {title}")
+        print(f"  Range     : {start_id} → {end_id} ({total} messages)")
+        print(f"  Buffer    : {BUFFER_SIZE}  |  Fetch: {FETCH_AHEAD}")
+        print(f"  Delay     : {SEND_DELAY_MIN}-{SEND_DELAY_MAX}s  "
+              f"| Burst/{BURST_EVERY}: {BURST_PAUSE_MIN}-{BURST_PAUSE_MAX}s")
+        print(f"  Auto-vote : {'ON ⚡' if AUTO_VOTE else 'OFF'}")
+        print(f"{'─'*60}\n")
 
         try:
-            await bot.send_message(
+            await safe_send(bot.send_message(
                 chat_id    = dest_chat_id,
                 text       = (
                     f"📚 *Quiz Export — {escape_md(title)}*\n"
-                    f"Range: `{start_id}` → `{end_id}` \\({total} messages\\)"
+                    f"Range: `{start_id}` → `{end_id}` \\({total} messages\\)\n"
+                    f"🐢 _Safe mode: {SEND_DELAY_MIN}\\-{SEND_DELAY_MAX}s between sends_"
                 ),
                 parse_mode = ParseMode.MARKDOWN_V2,
-            )
+            ))
         except Exception as e:
             print(f"  ⚠️  Header send failed: {e}")
 
-        # Bounded queue — producer blocks when full; consumer drains it
-        queue: asyncio.Queue = asyncio.Queue(maxsize=BUFFER_SIZE)
-
-        # Start producer in the background
+        queue         = asyncio.Queue(maxsize=BUFFER_SIZE)
         producer_task = asyncio.create_task(
             _fetch_producer(client, entity, msg_ids, queue, stop_event)
         )
 
         sent_as_image_for_poll: set = set()
-        prev_msg = None   # single-object lookahead for image→poll detection
+        prev_msg = None
 
         # ── Consumer loop ──────────────────────────────────────────────
         while True:
             message = await queue.get()
-
-            # Sentinel from producer — we're done
             if message is None:
                 break
 
@@ -1123,7 +1080,6 @@ async def run_scrape(
 
             # ── Plain text ─────────────────────────────────────────────
             if not message.media and message.text and message.text.strip():
-                # Flush any dangling standalone image before this text msg
                 await _flush_standalone_image(
                     bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                 )
@@ -1132,10 +1088,10 @@ async def run_scrape(
                 print(f"  📝  Text #{message.id}: \"{text[:60]}\"")
                 for chunk in [text[j:j+4000] for j in range(0, len(text), 4000)]:
                     try:
-                        await bot.send_message(chat_id=dest_chat_id, text=chunk)
+                        await safe_send(bot.send_message(chat_id=dest_chat_id, text=chunk))
                     except Exception as e:
                         print(f"  ❌  Text #{message.id} failed: {e}")
-                    await asyncio.sleep(SEND_DELAY)
+                    await smart_delay()
                 prev_msg = message
                 continue
 
@@ -1165,30 +1121,41 @@ async def run_scrape(
                     already_done_n += 1
                     print(f"  ✔  Already answered: \"{poll_data['question'][:52]}\"")
 
-                # Image→poll lookahead: prev_msg is the immediately preceding
-                # message — if it's an image, send it first and link the poll.
+                # ── Image pairing decision ─────────────────────────────
                 reply_to_id   = None
                 image_caption = ""
 
                 if prev_msg is not None and _is_image_message(prev_msg):
-                    print(f"      🖼️  prev msg {prev_msg.id} is image — sending before poll")
-                    image_path    = await download_image(client, prev_msg, prev_msg.id)
-                    image_caption = (prev_msg.text or "").strip()
-                    if image_path:
-                        try:
-                            with open(image_path, "rb") as f:
-                                sent_photo = await bot.send_photo(
-                                    chat_id = dest_chat_id,
-                                    photo   = f,
-                                    caption = image_caption[:1024] if image_caption else None,
-                                )
-                            reply_to_id = sent_photo.message_id
-                            sent_as_image_for_poll.add(prev_msg.id)
-                            await asyncio.sleep(SEND_DELAY)
-                        except Exception as e:
-                            print(f"  ❌  Image send failed for {prev_msg.id}: {e}")
-                        finally:
-                            await _cleanup_image(image_path)
+                    id_gap      = message.id - prev_msg.id
+                    no_question = _poll_has_no_question(poll_data)
+                    is_paired   = (id_gap == 1) or no_question
+
+                    if is_paired:
+                        reason = "consecutive" if id_gap == 1 else "poll has no question"
+                        print(f"      🖼️  Pairing img {prev_msg.id} → poll {message.id} ({reason})")
+                        image_path    = await download_image(client, prev_msg, prev_msg.id)
+                        image_caption = (prev_msg.text or "").strip()
+                        if image_path:
+                            try:
+                                with open(image_path, "rb") as f:
+                                    sent_photo = await safe_send(bot.send_photo(
+                                        chat_id = dest_chat_id,
+                                        photo   = f,
+                                        caption = image_caption[:1024] if image_caption else None,
+                                    ))
+                                reply_to_id = sent_photo.message_id
+                                sent_as_image_for_poll.add(prev_msg.id)
+                                await smart_delay()
+                            except Exception as e:
+                                print(f"  ❌  Paired image send failed {prev_msg.id}: {e}")
+                            finally:
+                                await _cleanup_image(image_path)
+                    else:
+                        print(f"      🔀  img {prev_msg.id} gap={id_gap}, poll has question "
+                              f"→ standalone flush")
+                        await _flush_standalone_image(
+                            bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
+                        )
 
                 poll_data["image_path"]    = None
                 poll_data["image_caption"] = image_caption
@@ -1212,60 +1179,64 @@ async def run_scrape(
                         )
                         if poll_data.get("explanation"):
                             plain += f"\n\n💡 {poll_data['explanation']}"
-                        await bot.send_message(chat_id=dest_chat_id, text=plain)
+                        await safe_send(bot.send_message(chat_id=dest_chat_id, text=plain))
                     except Exception as e2:
                         print(f"  ❌  Fallback also failed #{quiz_counter}: {e2}")
 
-                await asyncio.sleep(SEND_DELAY)
+                await smart_delay()
                 prev_msg = message
                 continue
 
             # ── Image / document ───────────────────────────────────────
             if isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)):
-                # Already sent as part of an earlier poll's image — skip
                 if message.id in sent_as_image_for_poll:
                     print(f"      ↩️  Msg {message.id} already sent as poll image — skipping")
                     prev_msg = message
                     continue
 
                 if not _is_image_message(message):
-                    # Non-image document: flush any pending image first
+                    # Non-image document
                     await _flush_standalone_image(
                         bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                     )
-                    doc  = getattr(message.media, "document", None)
-                    mime = getattr(doc, "mime_type", "") if doc else ""
+                    doc     = getattr(message.media, "document", None)
+                    mime    = getattr(doc, "mime_type", "") if doc else ""
                     caption = (message.text or "").strip()
                     label   = "📄 PDF" if "pdf" in mime else "📎 Document"
                     note    = f"{label} (msg #{message.id})"
                     if caption:
                         note += f"\n{caption}"
                     try:
-                        await bot.send_message(chat_id=dest_chat_id, text=note)
+                        await safe_send(bot.send_message(chat_id=dest_chat_id, text=note))
                     except Exception as e:
                         print(f"  ❌  Document notice failed: {e}")
-                    await asyncio.sleep(SEND_DELAY)
+                    await smart_delay()
                     prev_msg = message
                     continue
 
-                # It's an image — store in prev_msg and wait.
-                # If the very next message is a poll, the poll handler above
-                # will pick it up via prev_msg.
-                # If the next message is NOT a poll, _flush_standalone_image
-                # will send it at the top of that handler.
-                # Either way we never lose it.
-                print(f"      🖼️  Img #{message.id} — holding for next msg")
+                # ── It's an image ──────────────────────────────────────
+                # KEY FIX: if prev_msg is already an unclaimed image,
+                # flush it as standalone BEFORE storing the new image.
+                # This correctly handles:
+                #   question_img → poll → explanation_img → question_img → poll
+                # explanation_img is flushed here when question_img arrives.
+                await _flush_standalone_image(
+                    bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
+                )
+
+                print(f"      🖼️  Img #{message.id} — holding, waiting for next msg")
                 prev_msg = message
                 continue
 
             # ── Anything else ──────────────────────────────────────────
+            await _flush_standalone_image(
+                bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
+            )
             prev_msg = message
 
-        # ── Consumer loop ended — wait for producer to finish cleanly ──
         await producer_task
 
-        # Final flush: if the very last message in the range was a
-        # standalone image that was never followed by a poll
+        # Final flush — last message was a standalone image
         await _flush_standalone_image(
             bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
         )
@@ -1273,19 +1244,19 @@ async def run_scrape(
         await client.disconnect()
         client = None
 
-        print(f"\n{'═'*58}")
+        print(f"\n{'═'*60}")
         print(f"  📨  Fetched  : {total_fetched}")
         print(f"  🧩  Quizzes  : {quiz_counter}")
         print(f"  📝  Texts    : {text_counter}")
         print(f"  🗳️  AutoVote : {auto_voted_n}")
         print(f"  ✅  Already  : {already_done_n}")
-        print(f"{'═'*58}\n")
+        print(f"  📤  Sends    : {_send_counter}")
+        print(f"{'═'*60}\n")
 
         if quiz_counter == 0 and text_counter == 0:
-            await bot.send_message(
-                chat_id=dest_chat_id,
-                text="⚠️ Nothing found in this message range."
-            )
+            await safe_send(bot.send_message(
+                chat_id=dest_chat_id, text="⚠️ Nothing found in this message range."
+            ))
 
         done_text = (
             "✅ *Scrape complete\\!*\n\n"
@@ -1293,23 +1264,22 @@ async def run_scrape(
             f"📨 Messages fetched: `{total_fetched}`\n"
             f"🧩 Quizzes sent: `{quiz_counter}`\n"
             f"📝 Text messages: `{text_counter}`\n"
-            f"🗳️ Auto\\-voted: `{auto_voted_n}`\n\n"
+            f"🗳️ Auto\\-voted: `{auto_voted_n}`\n"
+            f"📤 Total sends: `{_send_counter}`\n\n"
             f"📬 Sent to: `{escape_md(str(dest_chat_id))}`"
         )
-        await bot.send_message(
-            chat_id    = user_id,
-            text       = done_text,
-            parse_mode = ParseMode.MARKDOWN_V2,
-        )
+        await safe_send(bot.send_message(
+            chat_id=user_id, text=done_text, parse_mode=ParseMode.MARKDOWN_V2
+        ))
         if str(dest_chat_id) != str(user_id):
-            await bot.send_message(
+            await safe_send(bot.send_message(
                 chat_id    = dest_chat_id,
                 text       = (
                     f"✅ *Done\\! {quiz_counter} quiz\\(es\\) and "
                     f"{text_counter} text message\\(s\\) delivered\\.*"
                 ),
                 parse_mode = ParseMode.MARKDOWN_V2,
-            )
+            ))
 
     except asyncio.CancelledError:
         print("  ⚠️  run_scrape cancelled")
@@ -1351,6 +1321,11 @@ async def run_scrape(
 
 # ================== POLL HELPERS =================
 
+def _poll_has_no_question(poll_data: dict) -> bool:
+    q = (poll_data.get("question") or "").strip()
+    return q == "" or q == "."
+
+
 def is_unattempted(media: MessageMediaPoll) -> bool:
     results = media.results
     if results is None:
@@ -1368,7 +1343,6 @@ def read_closed_results(message, poll_data: dict) -> dict:
     media   = message.media
     poll    = media.poll
     results = media.results
-
     answers = []
     for i, answer in enumerate(poll.answers):
         text  = answer.text.text if hasattr(answer.text, "text") else str(answer.text)
@@ -1380,21 +1354,13 @@ def read_closed_results(message, poll_data: dict) -> dict:
                     entry["chosen"] = getattr(res, "chosen", False)
                     break
         answers.append(entry)
-
     is_quiz = poll_data.get("is_quiz", False)
     if is_quiz:
         correct = get_correct_index(poll, results)
-        label   = f"option {correct + 1}" if correct is not None else "unknown"
-        print(f"      ✅  Closed quiz — correct: {label}")
+        print(f"      ✅  Closed quiz — correct: option {correct+1 if correct is not None else '?'}")
     else:
         correct = get_max_votes_index(poll, results)
-        if correct is not None:
-            winning_votes = answers[correct].get("voters", "?")
-            label = f"option {correct + 1} ({winning_votes} votes)"
-        else:
-            label = "no votes"
-        print(f"      📊  Closed poll — top answer: {label}")
-
+        print(f"      📊  Closed poll — top: option {correct+1 if correct is not None else '?'}")
     poll_data["answers"]              = answers
     poll_data["correct_answer_index"] = correct
     poll_data["total_voters"]         = results.total_voters if results else None
@@ -1419,7 +1385,7 @@ def get_correct_index(poll, results) -> Optional[int]:
 def get_max_votes_index(poll, results) -> Optional[int]:
     if not results or not results.results:
         return None
-    best_i      = None
+    best_i = best_voters = None
     best_voters = -1
     for res in results.results:
         v = res.voters or 0
@@ -1436,14 +1402,11 @@ def parse_poll(message, caption: str = "") -> Optional[dict]:
     media = message.media
     if not isinstance(media, MessageMediaPoll):
         return None
-
     poll    = media.poll
     results = media.results
-
     question_text = (
         poll.question.text if hasattr(poll.question, "text") else str(poll.question)
     )
-
     answers = []
     for i, answer in enumerate(poll.answers):
         answer_text = (
@@ -1457,7 +1420,6 @@ def parse_poll(message, caption: str = "") -> Optional[dict]:
                     entry["chosen"] = getattr(res, "chosen", False)
                     break
         answers.append(entry)
-
     return {
         "message_id":           message.id,
         "date":                 message.date.isoformat(),
@@ -1469,8 +1431,7 @@ def parse_poll(message, caption: str = "") -> Optional[dict]:
         "answers":              answers,
         "correct_answer_index": get_correct_index(poll, results),
         "explanation": (
-            results.solution
-            if results and getattr(results, "solution", None) else None
+            results.solution if results and getattr(results, "solution", None) else None
         ),
         "image_path":    None,
         "auto_voted":    False,
@@ -1480,12 +1441,10 @@ def parse_poll(message, caption: str = "") -> Optional[dict]:
 
 
 async def auto_vote_and_reveal(client, entity, message, poll_data: dict) -> dict:
-    dummy     = [random.choice(message.media.poll.answers).option]
-    q_preview = poll_data['question'][:50]
-    is_quiz   = poll_data.get("is_quiz", False)
-    kind_lbl  = "quiz" if is_quiz else "poll"
-    print(f"      🗳️  Voting ({kind_lbl}): \"{q_preview}\"")
-
+    dummy    = [random.choice(message.media.poll.answers).option]
+    is_quiz  = poll_data.get("is_quiz", False)
+    kind_lbl = "quiz" if is_quiz else "poll"
+    print(f"      🗳️  Voting ({kind_lbl}): \"{poll_data['question'][:50]}\"")
     try:
         await client(functions.messages.SendVoteRequest(
             peer=entity, msg_id=message.id, options=dummy
@@ -1510,7 +1469,6 @@ async def auto_vote_and_reveal(client, entity, message, poll_data: dict) -> dict
 
     up   = refreshed.media.poll
     ures = refreshed.media.results
-
     updated_answers = []
     for i, answer in enumerate(up.answers):
         text  = answer.text.text if hasattr(answer.text, "text") else str(answer.text)
@@ -1525,16 +1483,10 @@ async def auto_vote_and_reveal(client, entity, message, poll_data: dict) -> dict
 
     if is_quiz:
         correct = get_correct_index(up, ures)
-        label   = f"option {correct + 1}" if correct is not None else "still hidden"
-        print(f"      ✅  Correct answer: {label}")
+        print(f"      ✅  Correct: option {correct+1 if correct is not None else '?'}")
     else:
         correct = get_max_votes_index(up, ures)
-        if correct is not None:
-            winning_votes = updated_answers[correct].get("voters", "?")
-            label = f"option {correct + 1} ({winning_votes} votes)"
-        else:
-            label = "no votes yet"
-        print(f"      📊  Top answer: {label}")
+        print(f"      📊  Top: option {correct+1 if correct is not None else '?'}")
 
     poll_data["answers"]              = updated_answers
     poll_data["correct_answer_index"] = correct
@@ -1549,7 +1501,6 @@ async def auto_vote_and_reveal(client, entity, message, poll_data: dict) -> dict
 async def download_image(client, message, msg_id: int) -> Optional[str]:
     Path(IMAGE_DIR).mkdir(exist_ok=True)
     media = message.media
-
     if isinstance(media, MessageMediaPhoto):
         path = os.path.join(IMAGE_DIR, f"quiz_{msg_id}.jpg")
     elif isinstance(media, MessageMediaDocument):
@@ -1566,7 +1517,6 @@ async def download_image(client, message, msg_id: int) -> Optional[str]:
         path = os.path.join(IMAGE_DIR, f"quiz_{msg_id}{ext}")
     else:
         return None
-
     try:
         await client.download_media(message, file=path)
         return path
@@ -1584,20 +1534,20 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
     if correct is None or not answers:
         print(f"  ⚠️  Quiz #{number} — correct answer unknown, sending as text")
         caption = build_bot_caption(quiz, number)
-        img = quiz.get("image_path")
+        img     = quiz.get("image_path")
         try:
             if img and os.path.exists(img):
                 with open(img, "rb") as f:
-                    if image_caption:
-                        await bot.send_photo(chat_id=chat_id, photo=f,
-                                             caption=image_caption[:1024])
-                    else:
-                        await bot.send_photo(chat_id=chat_id, photo=f,
-                                             caption=caption,
-                                             parse_mode=ParseMode.MARKDOWN_V2)
+                    await safe_send(bot.send_photo(
+                        chat_id    = chat_id,
+                        photo      = f,
+                        caption    = image_caption[:1024] if image_caption else caption,
+                        parse_mode = None if image_caption else ParseMode.MARKDOWN_V2,
+                    ))
             else:
-                await bot.send_message(chat_id=chat_id, text=caption,
-                                       parse_mode=ParseMode.MARKDOWN_V2)
+                await safe_send(bot.send_message(
+                    chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2
+                ))
         except Exception as e:
             print(f"  ❌  Text fallback failed for #{number}: {e}")
         return
@@ -1607,9 +1557,13 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
     explanation  = (quiz.get("explanation") or "")[:200]
     is_quiz_type = quiz.get("is_quiz", True)
 
+    # Telegram requires a non-empty question
+    if not question.strip() or question.strip() == ".":
+        question = "❓"
+
     try:
         if is_quiz_type:
-            await bot.send_poll(
+            await safe_send(bot.send_poll(
                 chat_id             = chat_id,
                 question            = question,
                 options             = option_texts,
@@ -1619,10 +1573,10 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
                 is_anonymous        = True,
                 open_period         = None,
                 reply_to_message_id = reply_to_id,
-            )
-            print(f"  🗳️  Recreated quiz #{number}: \"{question[:50]}\"")
+            ))
+            print(f"  🗳️  Quiz #{number}: \"{question[:50]}\"")
         else:
-            await bot.send_poll(
+            await safe_send(bot.send_poll(
                 chat_id             = chat_id,
                 question            = question,
                 options             = option_texts,
@@ -1630,20 +1584,20 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
                 is_anonymous        = True,
                 open_period         = None,
                 reply_to_message_id = reply_to_id,
-            )
-            print(f"  📊  Recreated poll #{number}: \"{question[:50]}\"")
+            ))
+            print(f"  📊  Poll #{number}: \"{question[:50]}\"")
             if explanation:
-                await asyncio.sleep(SEND_DELAY)
+                await smart_delay()
                 winning  = option_texts[correct] if correct is not None else "N/A"
                 exp_text = f"🎯 Top answer: {winning}\n\n💡 {explanation}"
-                await bot.send_message(chat_id=chat_id, text=exp_text)
-                print(f"      💡  Sent poll explanation for #{number}")
+                await safe_send(bot.send_message(chat_id=chat_id, text=exp_text))
     except Exception as e:
-        print(f"  ⚠️  Poll API error for #{number}: {e} — falling back to text")
+        print(f"  ⚠️  Poll API error #{number}: {e} — falling back to text")
         try:
             caption = build_bot_caption(quiz, number)
-            await bot.send_message(chat_id=chat_id, text=caption,
-                                   parse_mode=ParseMode.MARKDOWN_V2)
+            await safe_send(bot.send_message(
+                chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2
+            ))
         except Exception as e2:
             print(f"  ❌  Text fallback also failed: {e2}")
 
@@ -1656,7 +1610,7 @@ async def health_handler(request):
 
 async def start_ping_server():
     app_web = web.Application()
-    app_web.router.add_get("/", health_handler)
+    app_web.router.add_get("/",       health_handler)
     app_web.router.add_get("/health", health_handler)
     runner = web.AppRunner(app_web)
     await runner.setup()
@@ -1670,7 +1624,7 @@ async def self_ping_loop():
         print("⚠️  RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
     url = RENDER_URL.rstrip("/") + "/health"
-    print(f"🔁 Self-ping enabled → {url} every {PING_INTERVAL}s")
+    print(f"🔁 Self-ping → {url} every {PING_INTERVAL}s")
     async with aiohttp.ClientSession() as session:
         while True:
             await asyncio.sleep(PING_INTERVAL)
@@ -1685,7 +1639,6 @@ async def self_ping_loop():
 
 def main():
     import httpx
-
     try:
         httpx.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
@@ -1708,18 +1661,16 @@ def main():
                 await ping_task
             except asyncio.CancelledError:
                 pass
-
         scrape_tasks = application.bot_data.get("scrape_tasks", set())
         if scrape_tasks:
-            print(f"⏳ Cancelling {len(scrape_tasks)} in-flight scrape task(s)…")
+            print(f"⏳ Cancelling {len(scrape_tasks)} scrape task(s)…")
             for t in list(scrape_tasks):
                 t.cancel()
             await asyncio.gather(*scrape_tasks, return_exceptions=True)
             print("✅ Scrape tasks cancelled.")
-
         try:
             await close_db()
-            print("✅ DB closed cleanly.")
+            print("✅ DB closed.")
         except Exception as e:
             print(f"⚠️  DB close error: {e}")
 
@@ -1731,7 +1682,6 @@ def main():
         .build()
     )
 
-    # Login
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
         states={
@@ -1742,24 +1692,18 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
-    # Manage saved destinations
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_destination", set_destination)],
         states={
-            ADD_DEST_PICK: [
-                CallbackQueryHandler(manage_dest_callback),
-            ],
-            ADD_DEST_TYPED: [
-                MessageHandler(
-                    (filters.TEXT & ~filters.COMMAND) | filters.FORWARDED,
-                    add_dest_typed,
-                ),
-            ],
+            ADD_DEST_PICK:  [CallbackQueryHandler(manage_dest_callback)],
+            ADD_DEST_TYPED: [MessageHandler(
+                (filters.TEXT & ~filters.COMMAND) | filters.FORWARDED,
+                add_dest_typed,
+            )],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
-    # Scrape
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("scrape", scrape_start)],
         states={
@@ -1776,10 +1720,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
 
     print("Bot is running...")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
